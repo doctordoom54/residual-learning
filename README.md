@@ -73,7 +73,8 @@ ros2 run traj_gen pwm_cmd
 
 This sends the predefined PWM duty cycle commands and should (ideally) produce a trajectory like the one below:
 
-<img width="800" height="800" alt="traj" src="https://github.com/user-attachments/assets/74f2cd59-1c09-4b17-bd86-5e7d66286495" />
+<img width="1822" height="1730" alt="image" src="https://github.com/user-attachments/assets/ea1679ec-650a-45fc-b677-a6c5387d16c3" />
+
 
 
 ## Debugging
