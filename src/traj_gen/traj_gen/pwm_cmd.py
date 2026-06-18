@@ -17,6 +17,10 @@ from std_msgs.msg import Float32
 LEFT_WHEELS = ("FL", "RL")
 RIGHT_WHEELS = ("FR", "RR")
 
+# Fixed publish rate: 50 Hz, regardless of the CSV's native sample rate.
+PUBLISH_RATE_HZ = 50.0
+PUBLISH_DT = 1.0 / PUBLISH_RATE_HZ
+
 pkg_share_dir = get_package_share_directory('traj_gen')
 CSV_FILE_PATH = os.path.join(pkg_share_dir, 'data', 'spiral_pwm_commands.csv')
 
@@ -25,7 +29,6 @@ class LeoCSVPlayer(Node):
         super().__init__("leo_csv_player")
 
         self.commands = []
-        self.current_index = 0
 
         # 1. Load the CSV data
         self._load_csv_data(CSV_FILE_PATH)
@@ -36,19 +39,25 @@ class LeoCSVPlayer(Node):
             topic = f"firmware/wheel_{wheel}/cmd_pwm_duty"
             self._wheel_publishers[wheel] = self.create_publisher(Float32, topic, 10)
 
-        # 3. Calculate dynamic publish rate
-        dt = self.commands[1][0] - self.commands[0][0]
-        publish_rate_hz = 1.0 / dt
-        
-        # 4. Start the timer
-        self._timer = self.create_timer(dt, self._on_timer)
+        # 3. Trajectory playback state.
+        # We publish at a fixed PUBLISH_DT (50 Hz) and zero-order-hold whichever
+        # CSV sample corresponds to the current playback time. This makes
+        # playback correct regardless of the CSV's native sample spacing
+        # (0.01s, 0.02s, or anything else) since lookup is by elapsed time,
+        # not by a fixed row-skip count.
+        self._traj_start_time = None
+        csv_dt = self.commands[1][0] - self.commands[0][0]
+        self.trajectory_duration = self.commands[-1][0]
+
+        # 4. Start the timer at the fixed 50 Hz rate
+        self._timer = self.create_timer(PUBLISH_DT, self._on_timer)
 
         self.get_logger().info(
             f"\n--- Loaded CSV Trajectory ---\n"
-            f"Total Commands: {len(self.commands)} steps\n"
-            f"Time Step (dt): {dt:.4f} seconds\n"
-            f"Publish Rate:   {publish_rate_hz:.1f} Hz\n"
-            f"Total Duration: {(len(self.commands) * dt):.1f} seconds\n"
+            f"Total Commands:   {len(self.commands)} rows\n"
+            f"CSV Sample Step:  {csv_dt:.4f} seconds\n"
+            f"Publish Rate:     {PUBLISH_RATE_HZ:.1f} Hz (fixed, zero-order hold)\n"
+            f"Total Duration:   {self.trajectory_duration:.2f} seconds\n"
             f"-----------------------------"
         )
 
@@ -60,8 +69,8 @@ class LeoCSVPlayer(Node):
 
         with open(filepath, 'r') as f:
             reader = csv.reader(f)
-            header = next(reader) # Skip header (time,pwm_r,pwm_l)
-            
+            header = next(reader)  # Skip header (time,pwm_r,pwm_l)
+
             for row in reader:
                 if len(row) == 3:
                     t = float(row[0])
@@ -73,36 +82,49 @@ class LeoCSVPlayer(Node):
             self.get_logger().error("CSV file contains insufficient data.")
             sys.exit(1)
 
+    def _lookup_command(self, elapsed):
+        """
+        Zero-order hold lookup: returns the most recent CSV command whose
+        timestamp is <= elapsed. Advances a cached index forward only,
+        since elapsed time is monotonically increasing.
+        """
+        idx = self._lookup_index
+        n = len(self.commands)
+
+        while idx + 1 < n and self.commands[idx + 1][0] <= elapsed:
+            idx += 1
+
+        self._lookup_index = idx
+        return self.commands[idx]
+
     def _on_timer(self):
-            """
-            Publishes command every 0.02s. 
-            Since input data is 0.01s, incrementing by 2 selects every 0.02s sample.
-            """
-            
-            # 1. Check end of trajectory
-            if self.current_index >= len(self.commands):
-                self.get_logger().info("Trajectory complete. Shutting down...")
-                self._timer.cancel()
-                self.stop()
-                # We call shutdown asynchronously to allow the stop commands to publish
-                rclpy.shutdown()
-                return
+        """Publishes the zero-order-held command at a fixed 50 Hz rate."""
+        if self._traj_start_time is None:
+            self._traj_start_time = time.monotonic()
+            self._lookup_index = 0
 
-            # 2. Extract command from CSV (Zero-Order Hold)
-            _, pwm_r, pwm_l = self.commands[self.current_index]
+        elapsed = time.monotonic() - self._traj_start_time
 
-            # 3. Publish
-            right_msg = Float32(data=pwm_r)
-            left_msg = Float32(data=pwm_l)
+        # 1. Check end of trajectory
+        if elapsed >= self.trajectory_duration:
+            self.get_logger().info("Trajectory complete. Shutting down...")
+            self._timer.cancel()
+            self.stop()
+            rclpy.shutdown()
+            return
 
-            for wheel in RIGHT_WHEELS:
-                self._wheel_publishers[wheel].publish(right_msg)
-            for wheel in LEFT_WHEELS:
-                self._wheel_publishers[wheel].publish(left_msg)
+        # 2. Zero-order hold: get the command active at this elapsed time
+        _, pwm_r, pwm_l = self._lookup_command(elapsed)
 
-            # 4. Advance pointer by 2 to skip the intermediate 0.01s step
-            self.current_index += 2
-            
+        # 3. Publish
+        right_msg = Float32(data=pwm_r)
+        left_msg = Float32(data=pwm_l)
+
+        for wheel in RIGHT_WHEELS:
+            self._wheel_publishers[wheel].publish(right_msg)
+        for wheel in LEFT_WHEELS:
+            self._wheel_publishers[wheel].publish(left_msg)
+
     def stop(self):
         """
         Publish 0% duty cycle to all wheels on shutdown to prevent 
@@ -125,7 +147,7 @@ def main():
     def _on_sigint(signum, frame):
         nonlocal stop_requested
         if stop_requested:
-            return  
+            return
         stop_requested = True
         node._timer.cancel()
         node.stop()
